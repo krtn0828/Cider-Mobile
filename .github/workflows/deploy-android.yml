@@ -19,14 +19,6 @@ jobs:
         run: echo "::set-output name=branch::${GITHUB_REF#refs/heads/}"
         id: extract_branch
 
-      - name: copy env staging # 説明2
-        if: ${{ steps.extract_branch.outputs.branch == 'staging' }}
-        run: cp .env.staging .env
-      
-      - name: copy env develop # 説明2
-        if: ${{ steps.extract_branch.outputs.branch == 'develop' }}
-        run: cp .env.development .env
-
       - name: yarn install
         run: yarn --frozen-lockfile
 
