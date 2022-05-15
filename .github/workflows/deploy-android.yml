@@ -26,7 +26,7 @@ jobs:
         run: yarn add gradlew
 
       - name: Build Android Debug # 説明3
-        run: ./gradlew assembleRelease
+        run: gradlew assembleRelease
 
       - name: Deploy App # 説明4
         working-directory: ./android
