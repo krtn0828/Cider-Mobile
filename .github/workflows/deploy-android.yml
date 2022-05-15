@@ -23,7 +23,7 @@ jobs:
         run: yarn --frozen-lockfile
 
       - name: yarn install
-        run: yarn install gradlew
+        run: yarn add gradlew
 
       - name: Build Android Debug # 説明3
         run: ./gradlew assembleRelease
