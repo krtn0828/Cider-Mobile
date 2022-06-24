@@ -1,12 +1,24 @@
 import 'dart:convert';
-import 'dart:ffi';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'package:http/http.dart' as http;
+import 'package:flutter_cache_manager/flutter_cache_manager.dart';
+
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:package_info_plus/package_info_plus.dart';
+
+import 'package:flutter_svg/flutter_svg.dart';
+
+import 'components/rounded_navbar.dart';
+
+// Pages
+import 'pages/home.dart';
+import 'pages/listen.dart';
+import 'pages/browse.dart';
+import 'pages/radio.dart';
 
 void main() {
   runApp(const MyApp());
@@ -17,9 +29,51 @@ Future<dynamic> getJson(String uri, dynamic headers) async {
   final response = await http.get(url, headers: headers);
   if (response.statusCode == 200) {
     return json.decode(response.body);
-  } else {
-    return {'statusCodeError': response.statusCode};
   }
+
+  return {'statusCodeError': response.statusCode, 'response': response.body};
+}
+
+Future<dynamic> getJsonCache(String uri, dynamic headers) async {
+  final res = await DefaultCacheManager().getSingleFile(
+    uri,
+    headers: headers,
+  );
+
+  if (await res.exists()) {
+    return json.decode(await res.readAsString());
+  }
+
+  // Try normal request, then actually fail
+  var url = Uri.parse(uri);
+  final response = await http.get(url, headers: headers);
+  if (response.statusCode == 200) {
+    if (kDebugMode) print("Fetched from network.");
+
+    // Shamelessly stolen from flutter_cache_manager src lol
+    var ageDuration = const Duration(days: 7);
+    final controlHeader = response.headers['Cache-Control'];
+    if (controlHeader != null) {
+      final controlSettings = controlHeader.split(',');
+      for (final setting in controlSettings) {
+        final sanitizedSetting = setting.trim().toLowerCase();
+        if (sanitizedSetting == 'no-cache') {
+          ageDuration = const Duration();
+        }
+        if (sanitizedSetting.startsWith('max-age=')) {
+          var validSeconds = int.tryParse(sanitizedSetting.split('=')[1]) ?? 0;
+          if (validSeconds > 0) {
+            ageDuration = Duration(seconds: validSeconds);
+          }
+        }
+      }
+    }
+
+    await DefaultCacheManager().putFile(uri, response.bodyBytes, eTag: response.headers['etag'], maxAge: ageDuration);
+    return json.decode(response.body);
+  }
+
+  return {'statusCodeError': response.statusCode, 'response': response.body};
 }
 
 class MyApp extends StatefulWidget {
@@ -30,11 +84,13 @@ class MyApp extends StatefulWidget {
 }
 
 class _MyAppState extends State<MyApp> {
-  static const mkChannel = MethodChannel('sh.cider.android/musickit');
+  final mkChannel = const MethodChannel('sh.cider.android/musickit');
   final storage = const FlutterSecureStorage(
       aOptions: AndroidOptions(
     encryptedSharedPreferences: true,
   ));
+
+  int _page = 0;
 
   String _devToken = "";
   String _usrToken = "";
@@ -44,29 +100,58 @@ class _MyAppState extends State<MyApp> {
   bool _hasErrored = false;
   String _errorMessage = "";
 
+  // MusicKit API
+  Future<Map<String, dynamic>> amAPI(String endpoint, [Map<String, dynamic>? query]) async {
+    if (_usrToken.isEmpty) {
+      return {'error': 'User token is empty'};
+    }
+
+    final headers = {
+      'Authorization': 'Bearer $_devToken',
+      'Music-User-Token': _usrToken,
+    };
+    final queryString = query?.entries.map((entry) {
+      return '${entry.key}=${entry.value}';
+    }).join('&');
+
+    final uri = "https://api.music.apple.com/v1/$endpoint${queryString != null ? '?$queryString' : ''}";
+    if (kDebugMode) print('amAPI: $uri');
+    final res = await getJsonCache(uri, headers);
+    if (res['statusCodeError'] != null) {
+      setState(() {
+        _errorMessage = "Call to amAPI endpoint $endpoint failed with status code ${res['statusCodeError']}";
+      });
+      if (res['statusCodeError'] == 400) {
+        if (kDebugMode) print("You've fucked up. Figure out what. ${res['response']}");
+      }
+      return {'error': res['statusCodeError']};
+    }
+
+    return res;
+  }
+
+  // MusicKit initialization
   Future<void> _musicKitAuthentication() async {
+    PackageInfo packageInfo = await PackageInfo.fromPlatform();
+    String version = packageInfo.version;
+
     // Fetch developer token via FETCH api.cider.sh
     final res = await getJson("https://api.cider.sh/v1", {
-      'user-agent': 'Cider/0.0.1',
+      'user-agent': 'Cider/$version',
     });
     if (res['statusCodeError'] != null) {
-      if (kDebugMode) {
-        print("Error fetching developer token: ${res['statusCodeError']}");
-      }
+      if (kDebugMode) print("Error fetching developer token: ${res['statusCodeError']}");
       return;
     }
 
-    // Is this redundant?
-    setState(() {
-      _devToken = res['token'];
-    });
+    // Not in a 'setState' because this does not change the state of the app
+    _devToken = res['token'];
 
     var usrToken = await storage.read(key: "usrToken");
     if (usrToken != null) {
       // Verify user token
-      final res = await getJson('https://api.music.apple.com/v1/me/library/songs', {
-        'Authorization': 'Bearer $_devToken',
-        'Music-User-Token': usrToken,
+      final res = await amAPI("me/library/songs", {
+        'limit': 1,
       });
       if (res['statusCodeError'] != null) {
         // Invalid token, delete it
@@ -91,16 +176,12 @@ class _MyAppState extends State<MyApp> {
           });
         }
       } on PlatformException catch (e) {
-        if (kDebugMode) {
-          print(e.message);
-        }
+        if (kDebugMode) print(e.message);
         setState(() {
           _isAuthenticated = false;
         });
       } on Exception catch (e) {
-        if (kDebugMode) {
-          print(e.toString());
-        }
+        if (kDebugMode) print(e.toString());
         setState(() {
           _isAuthenticated = false;
         });
@@ -122,8 +203,16 @@ class _MyAppState extends State<MyApp> {
     _musicKitAuthentication();
   }
 
+  // Rendering
+
   @override
   Widget build(BuildContext context) {
+    // Disable rotation
+    SystemChrome.setPreferredOrientations([
+      DeviceOrientation.portraitUp,
+    ]);
+
+    // The black screen of death
     // Show error message (if there is one)
     if (_hasErrored) {
       return Center(
@@ -137,6 +226,8 @@ class _MyAppState extends State<MyApp> {
       );
     }
 
+    // TODO: Replace with Cider logo
+    // Potentially place logo in progress indicator
     // Show loading indicator (if not authenticated)
     if (!_isAuthenticated) {
       return const Center(
@@ -144,15 +235,65 @@ class _MyAppState extends State<MyApp> {
       );
     }
 
+    // Create Screens
+    final List<Widget> pages = [
+      HomeScreen(amAPICall: amAPI),
+      const ListenScreen(),
+      const BrowseScreen(),
+      const RadioScreen(),
+    ];
+
     // Show app
     return MaterialApp(
       title: 'Cider',
-      home: Scaffold(
-        appBar: AppBar(
-          title: const Text('Cider Mobile Test'),
+      theme: ThemeData(
+        // Oh nice. Something to easily set colors throughout the app
+        canvasColor: Colors.grey[900],
+        primaryColor: Colors.grey[700],
+        primaryTextTheme: Typography.whiteCupertino,
+        textTheme: Typography.whiteCupertino,
+        primaryIconTheme: const IconThemeData(
+          color: Colors.white,
         ),
-        body: const Center(
-          child: Text('Tokens are loaded!'),
+        visualDensity: VisualDensity.adaptivePlatformDensity,
+      ),
+      debugShowCheckedModeBanner: false,
+      home: SafeArea(
+        child: Scaffold(
+          body: Column(
+            children: [
+              RoundedNavBar(
+                items: const [
+                  RoundedNavBarItem(
+                    icon: Icon(Icons.home_outlined),
+                    title: 'Home',
+                  ),
+                  RoundedNavBarItem(
+                    icon: Icon(Icons.play_circle_outline),
+                    title: 'Listen Now',
+                  ),
+                  RoundedNavBarItem(
+                    icon: Icon(Icons.language_outlined),
+                    title: 'Browse',
+                  ),
+                  RoundedNavBarItem(
+                    icon: Icon(Icons.sensors_outlined),
+                    title: 'Radio',
+                  ),
+                ],
+                onTap: (index) {
+                  if (kDebugMode) print('index $index');
+                  setState(() {
+                    _page = index;
+                  });
+                },
+              ),
+              const SizedBox(
+                height: 2,
+              ),
+              pages[_page],
+            ],
+          ),
         ),
       ),
     );
